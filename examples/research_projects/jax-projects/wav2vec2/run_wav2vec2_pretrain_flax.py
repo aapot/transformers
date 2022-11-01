@@ -531,17 +531,30 @@ def main():
             )
 
             diversity_loss = (num_codevectors - outputs.codevector_perplexity) / num_codevectors
+            diversity_loss = diversity_loss * batch["mask_time_indices"].sum()
             loss = contrastive_loss + diversity_loss_weight * diversity_loss
 
-            return loss
+            return loss, {"gumbel_temperature": gumbel_temperature, "contrastive_loss": contrastive_loss, "diversity_loss": diversity_loss, "codevector_perplexity": outputs.codevector_perplexity}
 
-        grad_fn = jax.value_and_grad(loss_fn)
-        loss, grad = grad_fn(state.params)
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+        (loss, logs), grad = grad_fn(state.params)
         grad = jax.lax.pmean(grad, "batch")
+
+        # average gradients over losses of all devices
+        num_losses = jax.lax.psum(batch["mask_time_indices"].sum(), "batch")
+        gradient_multiplier = jax.device_count() / num_losses
+        grad = jax.tree_map(lambda g: g * gradient_multiplier, grad)
         new_state = state.apply_gradients(grads=grad)
 
         metrics = jax.lax.pmean(
-            {"loss": loss, "learning_rate": linear_decay_lr_schedule_fn(state.step)}, axis_name="batch"
+            {
+                "loss": loss / num_losses,
+                "constrast_loss": logs["contrastive_loss"] / num_losses,
+                "div_loss": logs["diversity_loss"] / num_losses,
+                "codevector_perplexity": logs["codevector_perplexity"],
+                "lr": linear_decay_lr_schedule_fn(state.step),
+                "gumbel_temp": logs["gumbel_temperature"],
+            }, axis_name="batch"
         )
 
         return new_state, metrics, new_dropout_rng, new_gumbel_rng
@@ -551,6 +564,7 @@ def main():
 
     # Define eval fn
     def eval_step(params, batch):
+        num_losses = batch["mask_time_indices"].sum()
         negative_indices = batch.pop("sampled_negative_indices")
 
         outputs = model(**batch, params=params, train=False)
@@ -565,10 +579,16 @@ def main():
         )
 
         diversity_loss = (num_codevectors - outputs.codevector_perplexity) / num_codevectors
+        diversity_loss = diversity_loss * num_losses
         loss = contrastive_loss + diversity_loss_weight * diversity_loss
 
         # summarize metrics
-        metrics = {"loss": loss.mean(), "codevector_perplexity": outputs.codevector_perplexity}
+        metrics = {
+            "loss": loss.mean() / num_losses,
+            "constrast_loss": contrastive_loss.mean() / num_losses,
+            "div_loss": diversity_loss.mean() / num_losses,
+            "codevector_perplexity": outputs.codevector_perplexity
+        }
         metrics = jax.lax.pmean(metrics, axis_name="batch")
 
         return metrics
@@ -615,10 +635,10 @@ def main():
                 if has_tensorboard and jax.process_index() == 0:
                     write_train_metric(summary_writer, train_metrics, train_time, cur_step)
 
-                epochs.write(
-                    f"Step... ({cur_step} | Loss: {train_metric['loss'].mean()}, Learning Rate:"
-                    f" {train_metric['learning_rate'].mean()})"
-                )
+                log_str = f"Step... {cur_step} "
+                for k, v in train_metric.items():
+                    log_str += "| {}: {}".format(k, v.item())
+                epochs.write(log_str)
 
                 train_metrics = []
 
@@ -643,10 +663,10 @@ def main():
         eval_metrics = jax.tree_util.tree_map(jnp.mean, eval_metrics)
 
         # Update progress bar
-        epochs.write(
-            f"Epoch... ({epoch + 1}/{num_epochs} | Loss: {eval_metrics['loss']}, Perplexity:"
-            f" {eval_metrics['codevector_perplexity']})"
-        )
+        log_str = f"Epoch... {epoch + 1}/{num_epochs} "
+        for k, v in eval_metrics.items():
+            log_str += "| {}: {:.3e}".format(k, v.item())
+        epochs.write(log_str)
 
         # Save metrics
         if has_tensorboard and jax.process_index() == 0:
