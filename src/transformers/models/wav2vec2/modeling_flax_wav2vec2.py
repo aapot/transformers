@@ -670,11 +670,19 @@ class FlaxWav2Vec2EncoderLayerStableLayerNormCollection(nn.Module):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = layer(
-                hidden_states, attention_mask, deterministic=deterministic, output_attentions=output_attentions
-            )
+            # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
+            dropout_probability = np.random.uniform(0, 1)
+            
+            skip_the_layer = True if not deterministic and (dropout_probability < self.config.layerdrop) else False
+            if not skip_the_layer:
+                layer_outputs = layer(
+                    hidden_states, attention_mask, deterministic=deterministic, output_attentions=output_attentions
+                )
 
-            hidden_states = layer_outputs[0]
+                hidden_states = layer_outputs[0]
+            
+            if skip_the_layer:
+                layer_outputs = (None, None)
 
             if output_attentions:
                 all_attentions += (layer_outputs[1],)
