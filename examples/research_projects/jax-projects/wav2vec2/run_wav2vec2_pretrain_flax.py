@@ -220,18 +220,6 @@ class FlaxDataCollatorForWav2Vec2Pretraining:
         return batch
 
 
-def configure_logger(model_args: ModelArguments, training_args: TrainingArguments):
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
-    logging_level = logging.WARNING
-    if model_args.verbose_logging:
-        logging_level = logging.DEBUG
-    logger.setLevel(logging_level)
-
-
 def write_train_metric(summary_writer, train_metrics, train_time, step):
     summary_writer.scalar("train_time", train_time, step)
 
