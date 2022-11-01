@@ -508,7 +508,7 @@ def main():
             negative_indices = batch.pop("sampled_negative_indices")
 
             gumbel_temperature = jnp.clip(
-                model_args.max_gumbel_temperature * model_args.gumbel_temperature_decay**state.step,
+                model_args.max_gumbel_temperature * model_args.gumbel_temperature_decay**(state.step - 1),
                 a_min=model_args.min_gumbel_temperature,
             )
 
