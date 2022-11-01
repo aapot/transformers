@@ -672,7 +672,7 @@ class FlaxWav2Vec2EncoderLayerStableLayerNormCollection(nn.Module):
 
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             dropout_probability = np.random.uniform(0, 1)
-            
+
             skip_the_layer = True if not deterministic and (dropout_probability < self.config.layerdrop) else False
             if not skip_the_layer:
                 layer_outputs = layer(
@@ -810,7 +810,11 @@ class FlaxWav2Vec2GumbelVectorQuantizer(nn.Module):
             # sample code vector probs via gumbel in differentiateable way
             gumbel_rng = self.make_rng("gumbel")
             gumbels = jax.random.gumbel(gumbel_rng, hidden_states.shape)
-            codevector_probs = nn.softmax((hidden_states + gumbels) / temperature)
+            # pytorch implementation's gumbel_softmax 'hard' option which returns samples as one-hot vectors
+            y_soft = nn.softmax((hidden_states + gumbels) / temperature)
+            index = y_soft.argmax(axis=-1)
+            y_hard = jax.nn.one_hot(index, hidden_states.shape[-1])
+            codevector_probs = y_hard - jax.lax.stop_gradient(y_soft) + y_soft
 
             # compute perplexity
             codevector_soft_dist = nn.softmax(
