@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
 import logging
 import sys
+import os
+import math
 import time
-from dataclasses import field
+from dataclasses import asdict, dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 import numpy as np
-from datasets import DatasetDict, load_dataset
-from tqdm import tqdm
+import datasets
+from datasets import DatasetDict, concatenate_datasets, load_dataset
+from tqdm.auto import tqdm
 
 import flax
 import jax
 import jax.numpy as jnp
-import librosa
 import optax
 from flax import jax_utils, traverse_util
 from flax.training import train_state
 from flax.training.common_utils import get_metrics, onehot, shard
+
+from huggingface_hub import Repository
+import transformers
 from transformers import (
     FlaxWav2Vec2ForPreTraining,
     HfArgumentParser,
@@ -25,12 +31,13 @@ from transformers import (
     Wav2Vec2Config,
     Wav2Vec2FeatureExtractor,
     is_tensorboard_available,
+    set_seed,
 )
+from transformers.utils import get_full_repo_name
 from transformers.models.wav2vec2.modeling_flax_wav2vec2 import _compute_mask_indices, _sample_negative_indices
 
 
 logger = logging.getLogger(__name__)
-
 
 @flax.struct.dataclass
 class ModelArguments:
@@ -56,7 +63,7 @@ class ModelArguments:
         default=2.0, metadata={"help": "Maximum temperature for gumbel softmax."}
     )
     min_gumbel_temperature: Optional[float] = field(
-        default=0.1, metadata={"help": "Minimum temperature for gumbel softmax."}
+        default=0.5, metadata={"help": "Minimum temperature for gumbel softmax."}
     )
     gumbel_temperature_decay: Optional[float] = field(
         default=0.999995, metadata={"help": "Decay of gumbel temperature during training."}
@@ -76,7 +83,6 @@ class ModelArguments:
 class DataTrainingArguments:
     """
     Arguments pertaining to what data we are going to input our model for training and eval.
-
     Using `HfArgumentParser` we can turn this class
     into argparse arguments to be able to specify them on
     the command line.
@@ -85,13 +91,14 @@ class DataTrainingArguments:
     dataset_name: str = field(
         default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
     )
-    dataset_config_name: Optional[str] = field(
-        default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
+    dataset_config_names: List[str] = field(
+        default=None,
+        metadata={"help": "The configuration names of the dataset to use (via the datasets library)."}
     )
-    train_split_name: Optional[str] = field(
-        default="train",
+    dataset_split_names: List[str] = field(
+        default=None,
         metadata={
-            "help": "The name of the training data set split to use (via the datasets library). Defaults to 'train'"
+            "help": "The names of the training data set splits to use (via the datasets library)."
         },
     )
     validation_split_name: Optional[str] = field(
@@ -102,15 +109,15 @@ class DataTrainingArguments:
             )
         },
     )
-    speech_file_column: Optional[str] = field(
-        default="file",
+    audio_column_name: Optional[str] = field(
+        default="audio",
         metadata={"help": "Column in the dataset that contains speech file path. Defaults to 'file'"},
     )
     overwrite_cache: bool = field(
         default=False, metadata={"help": "Overwrite the cached preprocessed datasets or not."}
     )
     validation_split_percentage: Optional[int] = field(
-        default=5,
+        default=1,
         metadata={
             "help": "The percentage of the train set used as validation set in case there's no validation split"
         },
@@ -120,10 +127,13 @@ class DataTrainingArguments:
         metadata={"help": "The number of processes to use for the preprocessing."},
     )
     max_duration_in_seconds: Optional[float] = field(
-        default=20.0, metadata={"help": "Filter audio files that are longer than `max_duration_in_seconds` seconds"}
+        default=5.0, metadata={"help": "Filter out audio files that are longer than `max_duration_in_seconds` seconds"}
+    )
+    min_duration_in_seconds: Optional[float] = field(
+        default=3.0, metadata={"help": "Filter out audio files that are shorter than `min_duration_in_seconds` seconds"}
     )
     pad_to_multiple_of: Optional[int] = field(
-        default=1024,
+        default=None,
         metadata={
             "help": (
                 "If set will pad the sequence to a multiple of the provided value. This is important to avoid"
@@ -182,7 +192,7 @@ class FlaxDataCollatorForWav2Vec2Pretraining:
         batch_size = batch["input_values"].shape[0]
 
         attention_mask = None
-        if batch["attention_mask"] is not None:
+        if batch.get("attention_mask") is not None:
             output_lengths = self.model._get_feat_extract_output_lengths(batch["attention_mask"].sum(-1))
             attention_mask = np.zeros((batch_size, mask_indices_seq_length), dtype=np.int8)
 
@@ -237,15 +247,20 @@ def write_eval_metric(summary_writer, eval_metrics, step):
         summary_writer.scalar(f"eval_{metric_name}", value, step)
 
 
-def generate_batch_splits(samples_idx: np.ndarray, batch_size: int) -> np.ndarray:
+def generate_batch_splits(samples_idx: np.ndarray, batch_size: int, drop_last=True) -> np.ndarray:
+    """Generate batches of data for a specified batch size from sample indices. If the dataset size is not divisible by
+    the batch size and `drop_last` is `True`, the last incomplete batch is dropped. Else, it is returned."""
     num_samples = len(samples_idx)
-    samples_to_remove = num_samples % batch_size
-
-    if samples_to_remove != 0:
-        samples_idx = samples_idx[:-samples_to_remove]
-    sections_split = num_samples // batch_size
-    batch_idx = np.split(samples_idx, sections_split)
-    return batch_idx
+    if drop_last:
+        samples_to_remove = num_samples % batch_size
+        if samples_to_remove != 0:
+            samples_idx = samples_idx[:-samples_to_remove]
+        sections_split = num_samples // batch_size
+        samples_idx = samples_idx.reshape((sections_split, batch_size))
+    else:
+        sections_split = math.ceil(num_samples / batch_size)
+        samples_idx = np.array_split(samples_idx, sections_split)
+    return samples_idx
 
 
 def compute_contrastive_loss(
@@ -286,83 +301,131 @@ def main():
     # We now keep distinct sets of args, for a cleaner separation of concerns.
 
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
-
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    configure_logger(model_args, training_args)
-
-    # Downloading and loading a dataset from the hub.
-    datasets = load_dataset(data_args.dataset_name, data_args.dataset_config_name, cache_dir=model_args.cache_dir)
-
-    if "validation" not in datasets.keys():
-        # make sure only "validation" and "train" keys remain"
-        datasets = DatasetDict()
-        datasets["validation"] = load_dataset(
-            data_args.dataset_name,
-            data_args.dataset_config_name,
-            split=f"{data_args.train_split_name}[:{data_args.validation_split_percentage}%]",
-            cache_dir=model_args.cache_dir,
-        )
-        datasets["train"] = load_dataset(
-            data_args.dataset_name,
-            data_args.dataset_config_name,
-            split=f"{data_args.train_split_name}[{data_args.validation_split_percentage}%:]",
-            cache_dir=model_args.cache_dir,
-        )
+    if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
+        # If we pass only one argument to the script and it's the path to a json file,
+        # let's parse it to get our arguments.
+        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
-        # make sure only "validation" and "train" keys remain"
-        datasets = DatasetDict()
-        datasets["validation"] = load_dataset(
+        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    # Setup logging
+    # Setup logging
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+
+    log_level = training_args.get_process_log_level()
+    logger.setLevel(log_level)
+    datasets.utils.logging.set_verbosity(log_level)
+    transformers.utils.logging.set_verbosity(log_level)
+    transformers.utils.logging.enable_default_handler()
+    transformers.utils.logging.enable_explicit_format()
+
+    # Set the verbosity to info of the Transformers logger (on main process only):
+    logger.info(f"Training/evaluation parameters {training_args}")
+
+    # Set seed before initializing model.
+    set_seed(training_args.seed)
+
+    # Handle the repository creation
+    if training_args.push_to_hub:
+        if training_args.hub_model_id is None:
+            repo_name = get_full_repo_name(
+                Path(training_args.output_dir).absolute().name, token=training_args.hub_token
+            )
+        else:
+            repo_name = training_args.hub_model_id
+        repo = Repository(training_args.output_dir, clone_from=repo_name)
+
+    # 1. Download and create train, validation dataset
+    # We load all dataset configuration and datset split pairs passed in
+    # ``args.dataset_config_names`` and ``args.dataset_split_names``
+    datasets_splits = []
+    for dataset_config_name, train_split_name in zip(data_args.dataset_config_names, data_args.dataset_split_names):
+        # load dataset
+        dataset_split = load_dataset(
             data_args.dataset_name,
-            data_args.dataset_config_name,
-            split="validation",
+            dataset_config_name,
+            split=train_split_name,
             cache_dir=model_args.cache_dir,
         )
-        datasets["train"] = load_dataset(
-            data_args.dataset_name,
-            data_args.dataset_config_name,
-            split=f"{data_args.train_split_name}",
-            cache_dir=model_args.cache_dir,
+        datasets_splits.append(dataset_split)
+
+    # Next, we concatenate all configurations and splits into a single training dataset
+    raw_datasets = DatasetDict()
+    if len(datasets_splits) > 1:
+        raw_datasets["train"] = concatenate_datasets(datasets_splits)#.shuffle(seed=training_args.seed)
+    else:
+        raw_datasets["train"] = datasets_splits[0]
+
+    # Take ``args.validation_split_percentage`` from the training dataset for the validation_split_percentage
+    num_validation_samples = raw_datasets["train"].num_rows * data_args.validation_split_percentage // 100
+
+    if num_validation_samples == 0:
+        raise ValueError(
+            "`args.validation_split_percentage` is less than a single sample "
+            f"for {len(raw_datasets['train'])} training samples. Increase "
+            "`args.validation_split_percentage`. "
         )
+
+    raw_datasets["validation"] = raw_datasets["train"].select(range(num_validation_samples))
+    raw_datasets["train"] = raw_datasets["train"].select(range(num_validation_samples, raw_datasets["train"].num_rows))
+
+    # 2. Now we preprocess the datasets including loading the audio, resampling and normalization
+    # Thankfully, `datasets` takes care of automatically loading and resampling the audio,
+    # so that we just need to set the correct target sampling rate and normalize the input
+    # via the `feature_extractor`
+    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_args.model_name_or_path)
+
+    # make sure that dataset decodes audio with correct sampling rate
+    raw_datasets = raw_datasets.cast_column(
+        data_args.audio_column_name, datasets.features.Audio(sampling_rate=feature_extractor.sampling_rate)
+    )
 
     # only normalized-inputs-training is supported
-    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
-        model_args.model_name_or_path, cache_dir=model_args.cache_dir, do_normalize=True
-    )
+    if not feature_extractor.do_normalize:
+        raise ValueError(
+            "Training is only supported for normalized inputs. Make sure ``feature_extractor.do_normalize == True``"
+        )
+
+    # set max & min audio length in number of samples
+    max_length = int(data_args.max_duration_in_seconds * feature_extractor.sampling_rate)
+    min_length = int(data_args.min_duration_in_seconds * feature_extractor.sampling_rate)
 
     def prepare_dataset(batch):
-        # check that all files have the correct sampling rate
-        batch["speech"], _ = librosa.load(batch[data_args.speech_file_column], sr=feature_extractor.sampling_rate)
+        sample = batch[data_args.audio_column_name]
+
+        inputs = feature_extractor(
+            sample["array"], sampling_rate=sample["sampling_rate"], max_length=max_length, truncation=True
+        )
+        batch["input_values"] = inputs.input_values[0]
+        batch["input_length"] = len(inputs.input_values[0])
+
         return batch
 
-    # load audio files into numpy arrays
-    vectorized_datasets = datasets.map(
-        prepare_dataset, num_proc=data_args.preprocessing_num_workers, remove_columns=datasets["train"].column_names
-    )
+    vectorized_datasets = raw_datasets.map(
+            prepare_dataset,
+            num_proc=data_args.preprocessing_num_workers,
+            remove_columns=raw_datasets["train"].column_names,
+     
+        )
 
-    # filter audio files that are too long
-    vectorized_datasets = vectorized_datasets.filter(
-        lambda data: len(data["speech"]) < int(data_args.max_duration_in_seconds * feature_extractor.sampling_rate)
-    )
+    if min_length > 0.0:
+        vectorized_datasets = vectorized_datasets.filter(
+            lambda x: x > min_length,
+            num_proc=data_args.preprocessing_num_workers,
+            input_columns=["input_length"],
+        )
 
-    def normalize(batch):
-        return feature_extractor(batch["speech"], sampling_rate=feature_extractor.sampling_rate)
+    vectorized_datasets = vectorized_datasets.remove_columns("input_length")
 
-    # normalize and transform to `BatchFeatures`
-    vectorized_datasets = vectorized_datasets.map(
-        normalize,
-        batched=True,
-        num_proc=data_args.preprocessing_num_workers,
-        load_from_cache_file=not data_args.overwrite_cache,
-        remove_columns=vectorized_datasets["train"].column_names,
-    )
+    # 3. Load model
+    config = Wav2Vec2Config.from_pretrained(model_args.model_name_or_path)
 
     # pretraining is only supported for "newer" stable layer norm architecture
     # apply_spec_augment has to be True, mask_feature_prob has to be 0.0
-    config = Wav2Vec2Config.from_pretrained(
-        model_args.model_name_or_path,
-        cache_dir=model_args.cache_dir,
-    )
-
     if not config.do_stable_layer_norm or config.feat_extract_norm != "layer":
         raise ValueError(
             "PreTraining is only supported for ``config.do_stable_layer_norm=True`` and"
@@ -543,7 +606,7 @@ def main():
         num_train_samples = len(vectorized_datasets["train"])
         # Avoid using jax.numpy here in case of TPU training
         train_samples_idx = np.random.permutation(np.arange(num_train_samples))
-        train_batch_idx = generate_batch_splits(train_samples_idx, train_batch_size)
+        train_batch_idx = generate_batch_splits(train_samples_idx, train_batch_size, drop_last=True)
 
         # Gather the indexes for creating the batch and do a training step
         for step, batch_idx in enumerate(tqdm(train_batch_idx, desc="Training...", position=1)):
@@ -577,7 +640,7 @@ def main():
         num_eval_samples = len(vectorized_datasets["validation"])
         # Avoid using jax.numpy here in case of TPU training
         eval_samples_idx = np.arange(num_eval_samples)
-        eval_batch_idx = generate_batch_splits(eval_samples_idx, eval_batch_size)
+        eval_batch_idx = generate_batch_splits(eval_samples_idx, eval_batch_size, drop_last=False)
 
         eval_metrics = []
         for i, batch_idx in enumerate(tqdm(eval_batch_idx, desc="Evaluating ...", position=2)):
@@ -607,7 +670,9 @@ def main():
         # save checkpoint after each epoch and push checkpoint to the hub
         if jax.process_index() == 0:
             params = jax.device_get(jax.tree_util.tree_map(lambda x: x[0], state.params))
-            model.save_pretrained(training_args.output_dir, params=params, push_to_hub=training_args.push_to_hub)
+            model.save_pretrained(training_args.output_dir, params=params)
+            if training_args.push_to_hub:
+                repo.push_to_hub(commit_message=f"Saving weights and logs of epoch {epoch + 1}", blocking=False)
 
 
 if __name__ == "__main__":
