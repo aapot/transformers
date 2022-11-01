@@ -164,8 +164,6 @@ class FlaxDataCollatorForWav2Vec2Pretraining:
               maximum acceptable input length for the model if that argument is not provided.
             * :obj:`False` or :obj:`'do_not_pad'` (default): No padding (i.e., can output a batch with sequences of
               different lengths).
-        max_length (:obj:`int`, `optional`):
-            Maximum length of the ``input_values`` of the returned list and optionally padding length (see above).
         pad_to_multiple_of (:obj:`int`, `optional`):
             If set will pad the sequence to a multiple of the provided value.
             This is especially useful to enable the use of Tensor Cores on NVIDIA hardware with compute capability >=
@@ -176,13 +174,11 @@ class FlaxDataCollatorForWav2Vec2Pretraining:
     feature_extractor: Wav2Vec2FeatureExtractor
     padding: Union[bool, str] = "longest"
     pad_to_multiple_of: Optional[int] = None
-    max_length: Optional[int] = None
 
     def __call__(self, features: List[Dict[str, Union[List[int], np.ndarray]]]) -> Dict[str, np.ndarray]:
-        # reformat list to dict and set to pytorch format
+        # reformat list to dict and set to numpy format
         batch = self.feature_extractor.pad(
             features,
-            max_length=self.max_length,
             padding=self.padding,
             pad_to_multiple_of=self.pad_to_multiple_of,
             return_tensors="np",
@@ -201,20 +197,22 @@ class FlaxDataCollatorForWav2Vec2Pretraining:
             attention_mask[(np.arange(attention_mask.shape[0]), output_lengths - 1)] = 1
             attention_mask = jnp.flip(jnp.flip(attention_mask, -1).cumsum(-1), -1).astype("bool")
 
+        features_shape = (batch_size, mask_indices_seq_length)
+
         # sample randomly masked indices
         batch["mask_time_indices"] = _compute_mask_indices(
-            (batch_size, mask_indices_seq_length),
+            features_shape,
             self.model.config.mask_time_prob,
             self.model.config.mask_time_length,
             attention_mask=attention_mask,
-            min_masks=2,
+            min_masks=self.model.config.mask_time_min_masks,
         )
 
         # sample indices to take for negative vectors
         batch["sampled_negative_indices"] = _sample_negative_indices(
-            (batch["mask_time_indices"].shape + (self.model.config.proj_codevector_dim,)),
+            features_shape,
             self.model.config.num_negatives,
-            attention_mask=attention_mask,
+            mask_time_indices=batch["mask_time_indices"],
         )
 
         return batch
