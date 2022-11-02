@@ -997,6 +997,11 @@ class FlaxWav2Vec2PreTrainedModel(FlaxPreTrainedModel):
     ):
         return self.module._get_feat_extract_output_lengths(input_lengths, add_adapter=add_adapter)
 
+    def _get_feature_vector_attention_mask(
+        self, feature_vector_length: int, attention_mask: jnp.ndarray, add_adapter=None
+    ):
+        return self.module._get_feature_vector_attention_mask(feature_vector_length, attention_mask, add_adapter=add_adapter)
+
 
 class FlaxWav2Vec2Module(nn.Module):
     config: Wav2Vec2Config
@@ -1037,12 +1042,9 @@ class FlaxWav2Vec2Module(nn.Module):
             )
 
         hidden_states, extract_features = self.feature_projection(extract_features, deterministic=deterministic)
-        if mask_time_indices is not None:  # apply SpecAugment along time axis with given indices
-            hidden_states = jnp.where(
-                jnp.broadcast_to(mask_time_indices[:, :, None], hidden_states.shape),
-                jnp.broadcast_to(self.masked_spec_embed[None, None, :], hidden_states.shape),
-                hidden_states,
-            )
+        hidden_states = self._mask_hidden_states(
+            hidden_states, mask_time_indices=mask_time_indices, attention_mask=attention_mask, deterministic=deterministic
+        )
 
         encoder_outputs = self.encoder(
             hidden_states,
@@ -1067,6 +1069,59 @@ class FlaxWav2Vec2Module(nn.Module):
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
         )
+
+    def _mask_hidden_states(
+        self,
+        hidden_states: jnp.ndarray,
+        mask_time_indices: Optional[jnp.ndarray] = None,
+        attention_mask: Optional[jnp.ndarray] = None,
+        deterministic: bool = True,
+    ):
+        """
+        Masks extracted features along time axis and/or along feature axis according to
+        [SpecAugment](https://arxiv.org/abs/1904.08779).
+        """
+
+        # `config.apply_spec_augment` can set masking to False
+        if not getattr(self.config, "apply_spec_augment", True):
+            return hidden_states
+
+        # generate indices & apply SpecAugment along time axis
+        batch_size, sequence_length, hidden_size = hidden_states.shape
+
+        if mask_time_indices is not None:
+            # apply SpecAugment along time axis with given mask_time_indices
+            hidden_states = jnp.where(
+                jnp.broadcast_to(mask_time_indices[:, :, None], hidden_states.shape),
+                jnp.broadcast_to(self.masked_spec_embed[None, None, :], hidden_states.shape),
+                hidden_states,
+            )
+        elif self.config.mask_time_prob > 0 and not deterministic:
+            mask_time_indices = _compute_mask_indices(
+                (batch_size, sequence_length),
+                mask_prob=self.config.mask_time_prob,
+                mask_length=self.config.mask_time_length,
+                attention_mask=attention_mask,
+                min_masks=self.config.mask_time_min_masks,
+            )
+            hidden_states = jnp.where(
+                jnp.broadcast_to(mask_time_indices[:, :, None], hidden_states.shape),
+                jnp.broadcast_to(self.masked_spec_embed[None, None, :], hidden_states.shape),
+                hidden_states,
+            )
+
+        if self.config.mask_feature_prob > 0 and not deterministic:
+            # generate indices & apply SpecAugment along feature axis
+            mask_feature_indices = _compute_mask_indices(
+                (batch_size, hidden_size),
+                mask_prob=self.config.mask_feature_prob,
+                mask_length=self.config.mask_feature_length,
+                min_masks=self.config.mask_feature_min_masks,
+            )
+            mask_feature_indices = jnp.broadcast_to(mask_feature_indices[:, None], -1, sequence_length, -1)
+            hidden_states = hidden_states.at[mask_feature_indices].set(0)
+
+        return hidden_states
 
     def _get_feat_extract_output_lengths(
         self, input_lengths: Union[jnp.ndarray, int], add_adapter: Optional[bool] = None
@@ -1094,7 +1149,6 @@ class FlaxWav2Vec2Module(nn.Module):
     def _get_feature_vector_attention_mask(
         self, feature_vector_length: int, attention_mask: jnp.ndarray, add_adapter=None
     ):
-
         # Effectively attention_mask.sum(-1), but not inplace to be able to run
         # on inference mode.
         non_padded_lengths = attention_mask.cumsum(axis=-1)[:, -1]
@@ -1376,6 +1430,24 @@ class FlaxWav2Vec2ForPreTrainingModule(nn.Module):
                 input_lengths = _conv_out_length(input_lengths, 1, self.config.adapter_stride)
 
         return input_lengths
+
+    def _get_feature_vector_attention_mask(
+        self, feature_vector_length: int, attention_mask: jnp.ndarray, add_adapter=None
+    ):
+        # Effectively attention_mask.sum(-1), but not inplace to be able to run
+        # on inference mode.
+        non_padded_lengths = attention_mask.cumsum(axis=-1)[:, -1]
+
+        output_lengths = self._get_feat_extract_output_lengths(non_padded_lengths, add_adapter=add_adapter)
+
+        batch_size = attention_mask.shape[0]
+
+        attention_mask = jnp.zeros((batch_size, feature_vector_length), dtype=attention_mask.dtype)
+        # these two operations makes sure that all values
+        # before the output lengths indices are attended to
+        attention_mask = attention_mask.at[jnp.arange(attention_mask.shape[0]), output_lengths - 1].set(1)
+        attention_mask = jnp.flip(jnp.flip(attention_mask, -1).cumsum(-1), -1).astype("bool")
+        return attention_mask
 
 
 @add_start_docstrings("""Wav2Vec2 Model with a quantizer and `VQ` head on top.""", WAV_2_VEC_2_START_DOCSTRING)

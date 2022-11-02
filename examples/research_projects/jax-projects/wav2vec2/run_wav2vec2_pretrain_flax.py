@@ -183,19 +183,19 @@ class FlaxDataCollatorForWav2Vec2Pretraining:
             pad_to_multiple_of=self.pad_to_multiple_of,
             return_tensors="np",
         )
-        mask_indices_seq_length = self.model._get_feat_extract_output_lengths(batch["input_values"].shape[-1])
 
         batch_size = batch["input_values"].shape[0]
 
-        attention_mask = None
-        if batch.get("attention_mask") is not None:
-            output_lengths = self.model._get_feat_extract_output_lengths(batch["attention_mask"].sum(-1))
-            attention_mask = np.zeros((batch_size, mask_indices_seq_length), dtype=np.int8)
+        mask_indices_seq_length = self.model._get_feat_extract_output_lengths(batch["input_values"].shape[-1])
+        # make sure masked sequence length is a Python scalar
+        mask_indices_seq_length = int(mask_indices_seq_length)
 
-            # these two operations makes sure that all values
-            # before the output lengths indices are attended to
-            attention_mask[(np.arange(attention_mask.shape[0]), output_lengths - 1)] = 1
-            attention_mask = jnp.flip(jnp.flip(attention_mask, -1).cumsum(-1), -1).astype("bool")
+        # make sure that no loss is computed on padded inputs
+        if batch.get("attention_mask") is not None:
+            # compute real output lengths according to convolution formula
+            batch["sub_attention_mask"] = self.model._get_feature_vector_attention_mask(
+                mask_indices_seq_length, batch["attention_mask"]
+            )
 
         features_shape = (batch_size, mask_indices_seq_length)
 
@@ -204,11 +204,10 @@ class FlaxDataCollatorForWav2Vec2Pretraining:
             features_shape,
             self.model.config.mask_time_prob,
             self.model.config.mask_time_length,
-            attention_mask=attention_mask,
-            min_masks=self.model.config.mask_time_min_masks,
+            attention_mask=batch.get("sub_attention_mask"),
         )
 
-        # sample indices to take for negative vectors
+        # sample negative indices
         batch["sampled_negative_indices"] = _sample_negative_indices(
             features_shape,
             self.model.config.num_negatives,
@@ -505,6 +504,7 @@ def main():
         gumbel_rng, new_gumbel_rng = jax.random.split(gumbel_rng)
 
         def loss_fn(params):
+            batch.pop("sub_attention_mask", None)
             negative_indices = batch.pop("sampled_negative_indices")
 
             gumbel_temperature = jnp.clip(
@@ -565,6 +565,7 @@ def main():
     # Define eval fn
     def eval_step(params, batch):
         num_losses = batch["mask_time_indices"].sum()
+        batch.pop("sub_attention_mask", None)
         negative_indices = batch.pop("sampled_negative_indices")
 
         outputs = model(**batch, params=params, train=False)
