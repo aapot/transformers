@@ -810,10 +810,10 @@ class FlaxWav2Vec2GumbelVectorQuantizer(nn.Module):
             # sample code vector probs via gumbel in differentiateable way
             gumbel_rng = self.make_rng("gumbel")
             gumbels = jax.random.gumbel(gumbel_rng, hidden_states.shape)
-            # pytorch implementation's gumbel_softmax 'hard' option which returns samples as one-hot vectors
+            # pytorch implementation's gumbel_softmax uses 'hard' option which returns samples as one-hot vectors
             y_soft = nn.softmax((hidden_states + gumbels) / temperature)
             index = y_soft.argmax(axis=-1)
-            y_hard = jax.nn.one_hot(index, hidden_states.shape[-1])
+            y_hard = jnp.zeros_like(hidden_states).at[jnp.arange(len(hidden_states)), index].set(1.0)
             codevector_probs = y_hard - jax.lax.stop_gradient(y_soft) + y_soft
 
             # compute perplexity
