@@ -814,7 +814,7 @@ class FlaxWav2Vec2GumbelVectorQuantizer(nn.Module):
             y_soft = nn.softmax((hidden_states + gumbels) / temperature)
             index = y_soft.argmax(axis=-1)
             y_hard = jnp.zeros_like(hidden_states).at[jnp.arange(len(hidden_states)), index].set(1.0)
-            codevector_probs = y_hard - jax.lax.stop_gradient(y_soft) + y_soft
+            codevector_probs = y_hard - y_soft + y_soft
 
             # compute perplexity
             codevector_soft_dist = nn.softmax(
