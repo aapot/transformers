@@ -1118,8 +1118,12 @@ class FlaxWav2Vec2Module(nn.Module):
                 mask_length=self.config.mask_feature_length,
                 min_masks=self.config.mask_feature_min_masks,
             )
-            mask_feature_indices = jnp.broadcast_to(mask_feature_indices[:, None], -1, sequence_length, -1)
-            hidden_states = hidden_states.at[mask_feature_indices].set(0)
+            mask_feature_indices = jnp.broadcast_to(mask_feature_indices[:, None], (mask_feature_indices.shape[0], sequence_length, mask_feature_indices.shape[-1]))
+            hidden_states = jnp.where(
+                mask_feature_indices,
+                0,
+                hidden_states,
+            )
 
         return hidden_states
 
