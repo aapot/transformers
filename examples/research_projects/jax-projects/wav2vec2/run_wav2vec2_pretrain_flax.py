@@ -248,33 +248,62 @@ def generate_batch_splits(samples_idx: np.ndarray, batch_size: int, drop_last=Tr
     return samples_idx
 
 
+def compute_contrastive_logits(
+        target_features: jnp.ndarray,
+        negative_features: jnp.ndarray,
+        predicted_features: jnp.ndarray,
+        temperature: int = 0.1,
+    ):
+        """
+        Compute logits for contrastive loss based using cosine similarity as the distance measure between
+        `[positive_feature, negative_features]` and `[predicted_features]`. Additionally, temperature can be applied.
+        """
+        target_features = jnp.concatenate([target_features, negative_features], axis=0)
+
+        logits = optax.cosine_similarity(predicted_features, target_features, epsilon=1e-08) #torch.cosine_similarity has eps=1e-08
+
+        # apply temperature
+        logits = logits / temperature
+        return logits
+
+
 def compute_contrastive_loss(
-    quantized_features, transformer_features, negative_indices, mask_time_indices, logits_temp, num_negatives
+    quantized_features, transformer_features, negative_indices, mask_time_indices, logits_temp
 ):
     batch_size, sequence_length, hidden_size = quantized_features.shape
 
-    # take negative vectors from sampled indices
-    quantized_negatives = quantized_features.reshape(-1, hidden_size)[negative_indices.reshape(-1)]
-    quantized_negatives = quantized_negatives.reshape(
-        batch_size, sequence_length, num_negatives, hidden_size
+    # for training, we sample negatives
+    # 3. sample K negatives (distractors) quantized states for contrastive loss
+    # if attention_mask is passed, make sure that padded feature vectors cannot be sampled
+    # sample negative quantized vectors BTC => (BxT)C
+    negative_quantized_features = quantized_features.reshape(-1, hidden_size)[negative_indices.reshape(-1)]
+    negative_quantized_features = negative_quantized_features.reshape(
+        batch_size, sequence_length, -1, hidden_size
     ).transpose(2, 0, 1, 3)
 
-    target_features = jnp.concatenate([quantized_features[None, :], quantized_negatives], axis=0)
-    loss_logits = optax.cosine_similarity(transformer_features, target_features)
-    loss_logits = loss_logits / logits_temp
+    # 4. compute logits, corresponding to `logs = sim(c_t, [q_t, \sim{q}_t]) / \kappa`
+    # of equation (3) in https://arxiv.org/pdf/2006.11477.pdf
+    logits = compute_contrastive_logits(
+        quantized_features[None, :],
+        negative_quantized_features,
+        transformer_features,
+        logits_temp,
+    )
 
-    neg_is_pos = (quantized_features == quantized_negatives).all(-1)
-    neg_is_pos = jnp.concatenate([jnp.full((1,) + loss_logits.shape[1:], False), neg_is_pos], axis=0)
+    # 5. if a negative vector is identical to the positive (i.e. when codebook utilization is low),
+    # its cosine similarity will be masked
+    neg_is_pos = (quantized_features == negative_quantized_features).all(-1)
+    neg_is_pos = jnp.concatenate([jnp.full((1,) + logits.shape[1:], False), neg_is_pos], axis=0)
 
-    # make sure incorrectly sampled vectors don't contribute to loss
-    loss_logits = jnp.where(neg_is_pos, -1e9, loss_logits)
+    logits = jnp.where(neg_is_pos, -1e9, logits)
 
-    predictions = loss_logits.transpose(2, 1, 0).reshape(-1, loss_logits.shape[0])
-    targets = ((1 - mask_time_indices) * -100).transpose(1, 0).flatten()
-
-    target_mask = jnp.where(targets >= 0, 1.0, 0.0)
-    contrastive_loss = optax.softmax_cross_entropy(predictions, onehot(targets, predictions.shape[-1])) * target_mask
-
+    # 6. compute contrastive loss \mathbf{L}_m = cross_entropy(logs) =
+    # -log(exp(sim(c_t, q_t)/\kappa) / \sum_{\sim{q}} exp(sim(c_t, \sim{q})/\kappa))
+    logits = logits.transpose(2, 1, 0).reshape(-1, logits.shape[0])
+    target = ((1 - mask_time_indices) * -100).transpose(1, 0).flatten()
+    
+    target_mask = jnp.where(target >= 0, 1.0, 0.0)
+    contrastive_loss = optax.softmax_cross_entropy(logits, onehot(target, logits.shape[-1])) * target_mask
     contrastive_loss = contrastive_loss.sum()
 
     return contrastive_loss
@@ -527,7 +556,6 @@ def main():
                 negative_indices,
                 batch["mask_time_indices"],
                 contrastive_logits_temperature,
-                num_negatives,
             )
 
             diversity_loss = (num_codevectors - outputs.codevector_perplexity) / num_codevectors
@@ -576,7 +604,6 @@ def main():
             negative_indices,
             batch["mask_time_indices"],
             contrastive_logits_temperature,
-            num_negatives,
         )
 
         diversity_loss = (num_codevectors - outputs.codevector_perplexity) / num_codevectors
