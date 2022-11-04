@@ -26,7 +26,9 @@ import jax.numpy as jnp
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen.attention import dot_product_attention_weights
 from flax.traverse_util import flatten_dict, unflatten_dict
+from flax.training.common_utils import onehot
 from jax import lax
+import optax
 
 from ...modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 from ...modeling_flax_utils import (
@@ -78,7 +80,7 @@ class FlaxWav2Vec2ForPreTrainingOutput(ModelOutput):
     Output type of [`FlaxWav2Vec2ForPreTrainingOutput`], with potential hidden states and attentions.
 
     Args:
-        loss (*optional*, returned when model is in train mode, `jnp.ndarray` of shape `(1,)`):
+        loss (*optional*, returned when `sample_negative_indices` are passed, `jnp.ndarray` of shape `(1,)`):
             Total loss as the sum of the contrastive loss (L_m) and the diversity loss (L_d) as stated in the [official
             paper](https://arxiv.org/pdf/2006.11477.pdf) . (classification) loss.
         projected_states (`jnp.ndarray` of shape `(batch_size, sequence_length, config.proj_codevector_dim)`):
@@ -98,13 +100,20 @@ class FlaxWav2Vec2ForPreTrainingOutput(ModelOutput):
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
+        contrastive_loss (*optional*, returned when `sample_negative_indices` are passed, `jnp.ndarray` of shape `(1,)`):
+            The contrastive loss (L_m) as stated in the [official paper](https://arxiv.org/pdf/2006.11477.pdf) .
+        diversity_loss (*optional*, returned when `sample_negative_indices` are passed, `jnp.ndarray` of shape `(1,)`):
+            The diversity loss (L_d) as stated in the [official paper](https://arxiv.org/pdf/2006.11477.pdf) .
     """
 
+    loss: Optional[jnp.ndarray] = None
     projected_states: jnp.ndarray = None
     projected_quantized_states: jnp.ndarray = None
     codevector_perplexity: jnp.ndarray = None
     hidden_states: Optional[Tuple[jnp.ndarray]] = None
     attentions: Optional[Tuple[jnp.ndarray]] = None
+    contrastive_loss: Optional[jnp.ndarray] = None
+    diversity_loss: Optional[jnp.ndarray] = None
 
 
 def _compute_mask_indices(
@@ -1357,17 +1366,37 @@ class FlaxWav2Vec2ForPreTrainingModule(nn.Module):
             dtype=self.dtype,
         )
 
+    def compute_contrastive_logits(
+        self,
+        target_features: jnp.ndarray,
+        negative_features: jnp.ndarray,
+        predicted_features: jnp.ndarray,
+        temperature: int = 0.1,
+    ):
+        """
+        Compute logits for contrastive loss based using cosine similarity as the distance measure between
+        `[positive_feature, negative_features]` and `[predicted_features]`. Additionally, temperature can be applied.
+        """
+        target_features = jnp.concatenate([target_features, negative_features], axis=0)
+
+        logits = optax.cosine_similarity(predicted_features, target_features, epsilon=1e-08) #torch.cosine_similarity has eps=1e-08
+
+        # apply temperature
+        logits = logits / temperature
+        return logits
+
     def __call__(
         self,
-        input_values,
-        attention_mask=None,
-        mask_time_indices=None,
+        input_values: Optional[jnp.ndarray],
+        attention_mask: Optional[jnp.ndarray] = None,
+        mask_time_indices: Optional[jnp.ndarray] = None,
+        sampled_negative_indices: Optional[jnp.ndarray] = None,
         gumbel_temperature: int = 1,
         deterministic: bool = True,
-        output_attentions=None,
-        output_hidden_states=None,
-        freeze_feature_encoder=False,
-        return_dict=None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        freeze_feature_encoder: Optional[bool] = False,
+        return_dict: Optional[bool] = None,
     ):
         r"""
         Returns:
@@ -1391,25 +1420,76 @@ class FlaxWav2Vec2ForPreTrainingModule(nn.Module):
             return_dict=return_dict,
         )
 
-        # project all transformed features (including masked) to final vq dim
+        # 1. project all transformed features (including masked) to final vq dim
         transformer_features = self.project_hid(outputs[0])
 
-        # quantize all (unmasked) extracted features and project to final vq dim
+        # 2. quantize all (unmasked) extracted features and project to final vq dim
         extract_features = self.dropout_features(outputs[1], deterministic=deterministic)
+
         quantized_features, codevector_perplexity = self.quantizer(
             extract_features, mask_time_indices, deterministic=deterministic, temperature=gumbel_temperature
         )
         quantized_features = self.project_q(quantized_features)
 
+        loss = contrastive_loss = diversity_loss = None
+        if sampled_negative_indices is not None:
+            batch_size, sequence_length, hidden_size = quantized_features.shape
+
+            # for training, we sample negatives
+            # 3. sample K negatives (distractors) quantized states for contrastive loss
+            # if attention_mask is passed, make sure that padded feature vectors cannot be sampled
+            # sample negative quantized vectors BTC => (BxT)C
+            negative_quantized_features = quantized_features.reshape(-1, hidden_size)[sampled_negative_indices.reshape(-1)]
+            negative_quantized_features = negative_quantized_features.reshape(
+                batch_size, sequence_length, -1, hidden_size
+            ).transpose(2, 0, 1, 3)
+
+            # 4. compute logits, corresponding to `logs = sim(c_t, [q_t, \sim{q}_t]) / \kappa`
+            # of equation (3) in https://arxiv.org/pdf/2006.11477.pdf
+            logits = self.compute_contrastive_logits(
+                quantized_features[None, :],
+                negative_quantized_features,
+                transformer_features,
+                self.config.contrastive_logits_temperature,
+            )
+
+            # 5. if a negative vector is identical to the positive (i.e. when codebook utilization is low),
+            # its cosine similarity will be masked
+            neg_is_pos = (quantized_features == negative_quantized_features).all(-1)
+            neg_is_pos = jnp.concatenate([jnp.full((1,) + logits.shape[1:], False), neg_is_pos], axis=0)
+
+            logits = jnp.where(neg_is_pos, -1e9, logits)
+
+            # 6. compute contrastive loss \mathbf{L}_m = cross_entropy(logs) =
+            # -log(exp(sim(c_t, q_t)/\kappa) / \sum_{\sim{q}} exp(sim(c_t, \sim{q})/\kappa))
+            logits = logits.transpose(2, 1, 0).reshape(-1, logits.shape[0])
+            target = ((1 - mask_time_indices) * -100).transpose(1, 0).flatten()
+            
+            target_mask = jnp.where(target >= 0, 1.0, 0.0)
+            contrastive_loss = optax.softmax_cross_entropy(logits, onehot(target, logits.shape[-1])) * target_mask
+            contrastive_loss = contrastive_loss.sum()
+
+            # 7. compute diversity loss: \mathbf{L}_d
+            num_codevectors = self.config.num_codevectors_per_group * self.config.num_codevector_groups
+            diversity_loss = ((num_codevectors - codevector_perplexity) / num_codevectors) * mask_time_indices.sum()
+
+            # 8. \mathbf{L} = \mathbf{L}_m + \alpha * \mathbf{L}_d
+            loss = contrastive_loss + self.config.diversity_loss_weight * diversity_loss
+
         if not return_dict:
+            if loss is not None:
+                return (loss, transformer_features, quantized_features, codevector_perplexity) + outputs[2:]
             return (transformer_features, quantized_features, codevector_perplexity) + outputs[2:]
 
         return FlaxWav2Vec2ForPreTrainingOutput(
+            loss=loss,
             projected_states=transformer_features,
             projected_quantized_states=quantized_features,
             codevector_perplexity=codevector_perplexity,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            contrastive_loss=contrastive_loss,
+            diversity_loss=diversity_loss,
         )
 
     def _get_feat_extract_output_lengths(
@@ -1462,9 +1542,10 @@ class FlaxWav2Vec2ForPreTraining(FlaxWav2Vec2PreTrainedModel):
     # overwrite since has `gumbel_temperature` input
     def __call__(
         self,
-        input_values,
-        attention_mask=None,
-        mask_time_indices=None,
+        input_values: Optional[jnp.ndarray],
+        attention_mask: Optional[jnp.ndarray] = None,
+        mask_time_indices: Optional[jnp.ndarray] = None,
+        sampled_negative_indices: Optional[jnp.ndarray] = None,
         gumbel_temperature: int = 1,
         params: dict = None,
         dropout_rng: jax.random.PRNGKey = None,
@@ -1501,6 +1582,7 @@ class FlaxWav2Vec2ForPreTraining(FlaxWav2Vec2PreTrainedModel):
             jnp.array(input_values, dtype="f4"),
             jnp.array(attention_mask, dtype="i4"),
             mask_time_indices,
+            sampled_negative_indices,
             gumbel_temperature,
             not train,
             output_attentions,

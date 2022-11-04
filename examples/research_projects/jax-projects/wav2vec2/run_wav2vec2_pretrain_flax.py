@@ -248,67 +248,6 @@ def generate_batch_splits(samples_idx: np.ndarray, batch_size: int, drop_last=Tr
     return samples_idx
 
 
-def compute_contrastive_logits(
-        target_features: jnp.ndarray,
-        negative_features: jnp.ndarray,
-        predicted_features: jnp.ndarray,
-        temperature: int = 0.1,
-    ):
-        """
-        Compute logits for contrastive loss based using cosine similarity as the distance measure between
-        `[positive_feature, negative_features]` and `[predicted_features]`. Additionally, temperature can be applied.
-        """
-        target_features = jnp.concatenate([target_features, negative_features], axis=0)
-
-        logits = optax.cosine_similarity(predicted_features, target_features, epsilon=1e-08) #torch.cosine_similarity has eps=1e-08
-
-        # apply temperature
-        logits = logits / temperature
-        return logits
-
-
-def compute_contrastive_loss(
-    quantized_features, transformer_features, negative_indices, mask_time_indices, logits_temp
-):
-    batch_size, sequence_length, hidden_size = quantized_features.shape
-
-    # for training, we sample negatives
-    # 3. sample K negatives (distractors) quantized states for contrastive loss
-    # if attention_mask is passed, make sure that padded feature vectors cannot be sampled
-    # sample negative quantized vectors BTC => (BxT)C
-    negative_quantized_features = quantized_features.reshape(-1, hidden_size)[negative_indices.reshape(-1)]
-    negative_quantized_features = negative_quantized_features.reshape(
-        batch_size, sequence_length, -1, hidden_size
-    ).transpose(2, 0, 1, 3)
-
-    # 4. compute logits, corresponding to `logs = sim(c_t, [q_t, \sim{q}_t]) / \kappa`
-    # of equation (3) in https://arxiv.org/pdf/2006.11477.pdf
-    logits = compute_contrastive_logits(
-        quantized_features[None, :],
-        negative_quantized_features,
-        transformer_features,
-        logits_temp,
-    )
-
-    # 5. if a negative vector is identical to the positive (i.e. when codebook utilization is low),
-    # its cosine similarity will be masked
-    neg_is_pos = (quantized_features == negative_quantized_features).all(-1)
-    neg_is_pos = jnp.concatenate([jnp.full((1,) + logits.shape[1:], False), neg_is_pos], axis=0)
-
-    logits = jnp.where(neg_is_pos, -1e9, logits)
-
-    # 6. compute contrastive loss \mathbf{L}_m = cross_entropy(logs) =
-    # -log(exp(sim(c_t, q_t)/\kappa) / \sum_{\sim{q}} exp(sim(c_t, \sim{q})/\kappa))
-    logits = logits.transpose(2, 1, 0).reshape(-1, logits.shape[0])
-    target = ((1 - mask_time_indices) * -100).transpose(1, 0).flatten()
-    
-    target_mask = jnp.where(target >= 0, 1.0, 0.0)
-    contrastive_loss = optax.softmax_cross_entropy(logits, onehot(target, logits.shape[-1])) * target_mask
-    contrastive_loss = contrastive_loss.sum()
-
-    return contrastive_loss
-
-
 def main():
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
@@ -522,10 +461,6 @@ def main():
 
     # Setup train state and define training hyper-parameters
     state = train_state.TrainState.create(apply_fn=model.__call__, params=model.params, tx=adamw)
-    num_negatives = model.config.num_negatives
-    contrastive_logits_temperature = model.config.contrastive_logits_temperature
-    num_codevectors = model.config.num_codevectors_per_group * model.config.num_codevector_groups
-    diversity_loss_weight = model.config.diversity_loss_weight
 
     # Define gradient update step fn
     def train_step(state, batch, dropout_rng, gumbel_rng):
@@ -534,7 +469,6 @@ def main():
 
         def loss_fn(params):
             batch.pop("sub_attention_mask", None)
-            negative_indices = batch.pop("sampled_negative_indices")
 
             gumbel_temperature = jnp.clip(
                 model_args.max_gumbel_temperature * model_args.gumbel_temperature_decay**(state.step - 1),
@@ -550,19 +484,7 @@ def main():
                 train=True,
             )
 
-            contrastive_loss = compute_contrastive_loss(
-                outputs.projected_quantized_states,
-                outputs.projected_states,
-                negative_indices,
-                batch["mask_time_indices"],
-                contrastive_logits_temperature,
-            )
-
-            diversity_loss = (num_codevectors - outputs.codevector_perplexity) / num_codevectors
-            diversity_loss = diversity_loss * batch["mask_time_indices"].sum()
-            loss = contrastive_loss + diversity_loss_weight * diversity_loss
-
-            return loss, {"gumbel_temperature": gumbel_temperature, "contrastive_loss": contrastive_loss, "diversity_loss": diversity_loss, "codevector_perplexity": outputs.codevector_perplexity}
+            return outputs.loss, {"gumbel_temperature": gumbel_temperature, "contrastive_loss": outputs.contrastive_loss, "diversity_loss": outputs.diversity_loss, "codevector_perplexity": outputs.codevector_perplexity}
 
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
         (loss, logs), grad = grad_fn(state.params)
@@ -594,27 +516,14 @@ def main():
     def eval_step(params, batch):
         num_losses = batch["mask_time_indices"].sum()
         batch.pop("sub_attention_mask", None)
-        negative_indices = batch.pop("sampled_negative_indices")
 
         outputs = model(**batch, params=params, train=False)
 
-        contrastive_loss = compute_contrastive_loss(
-            outputs.projected_quantized_states,
-            outputs.projected_states,
-            negative_indices,
-            batch["mask_time_indices"],
-            contrastive_logits_temperature,
-        )
-
-        diversity_loss = (num_codevectors - outputs.codevector_perplexity) / num_codevectors
-        diversity_loss = diversity_loss * num_losses
-        loss = contrastive_loss + diversity_loss_weight * diversity_loss
-
         # summarize metrics
         metrics = {
-            "loss": loss.mean() / num_losses,
-            "constrast_loss": contrastive_loss.mean() / num_losses,
-            "div_loss": diversity_loss.mean() / num_losses,
+            "loss": outputs.loss.mean() / num_losses,
+            "constrast_loss": outputs.contrastive_loss.mean() / num_losses,
+            "div_loss": outputs.diversity_loss.mean() / num_losses,
             "codevector_perplexity": outputs.codevector_perplexity
         }
         metrics = jax.lax.pmean(metrics, axis_name="batch")
