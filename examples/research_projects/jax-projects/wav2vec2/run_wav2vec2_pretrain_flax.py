@@ -496,6 +496,11 @@ def main():
         grad = jax.tree_map(lambda g: g * gradient_multiplier, grad)
         new_state = state.apply_gradients(grads=grad)
 
+        # sum losses over all devices for logging
+        loss = jax.lax.psum(loss.sum(), "batch")
+        logs["contrastive_loss"] = jax.lax.psum(logs["contrastive_loss"].sum(), "batch")
+        logs["diversity_loss"] = jax.lax.psum(logs["diversity_loss"].sum(), "batch")
+
         metrics = jax.lax.pmean(
             {
                 "loss": loss / num_losses,
@@ -519,14 +524,20 @@ def main():
 
         outputs = model(**batch, params=params, train=False)
 
+        # sum losses over all devices for logging
+        outputs.loss = jax.lax.psum(outputs.loss.sum(), "batch")
+        outputs.contrastive_loss = jax.lax.psum(outputs.contrastive_loss.sum(), "batch")
+        outputs.diversity_loss = jax.lax.psum(outputs.diversity_loss.sum(), "batch")
+
         # summarize metrics
-        metrics = {
-            "loss": outputs.loss.mean() / num_losses,
-            "constrast_loss": outputs.contrastive_loss.mean() / num_losses,
-            "div_loss": outputs.diversity_loss.mean() / num_losses,
-            "codevector_perplexity": outputs.codevector_perplexity
-        }
-        metrics = jax.lax.pmean(metrics, axis_name="batch")
+        metrics = jax.lax.pmean(
+            {
+                "loss": outputs.loss / num_losses,
+                "constrast_loss": outputs.contrastive_loss / num_losses,
+                "div_loss": outputs.diversity_loss / num_losses,
+                "codevector_perplexity": outputs.codevector_perplexity
+            }, axis_name="batch"
+        )
 
         return metrics
 
