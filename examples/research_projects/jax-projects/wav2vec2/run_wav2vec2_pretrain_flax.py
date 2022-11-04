@@ -525,16 +525,16 @@ def main():
         outputs = model(**batch, params=params, train=False)
 
         # sum losses over all devices for logging
-        outputs.loss = jax.lax.psum(outputs.loss.sum(), "batch")
-        outputs.contrastive_loss = jax.lax.psum(outputs.contrastive_loss.sum(), "batch")
-        outputs.diversity_loss = jax.lax.psum(outputs.diversity_loss.sum(), "batch")
+        loss = jax.lax.psum(outputs.loss.sum(), "batch")
+        contrastive_loss = jax.lax.psum(outputs.contrastive_loss.sum(), "batch")
+        diversity_loss = jax.lax.psum(outputs.diversity_loss.sum(), "batch")
 
         # summarize metrics
         metrics = jax.lax.pmean(
             {
-                "loss": outputs.loss / num_losses,
-                "constrast_loss": outputs.contrastive_loss / num_losses,
-                "div_loss": outputs.diversity_loss / num_losses,
+                "loss": loss / num_losses,
+                "constrast_loss": contrastive_loss / num_losses,
+                "div_loss": diversity_loss / num_losses,
                 "codevector_perplexity": outputs.codevector_perplexity
             }, axis_name="batch"
         )
