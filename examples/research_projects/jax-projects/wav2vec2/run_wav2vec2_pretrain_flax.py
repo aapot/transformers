@@ -205,6 +205,7 @@ class FlaxDataCollatorForWav2Vec2Pretraining:
             self.model.config.mask_time_prob,
             self.model.config.mask_time_length,
             attention_mask=batch.get("sub_attention_mask"),
+            min_masks=self.model.config.mask_time_min_masks,
         )
 
         # sample negative indices
