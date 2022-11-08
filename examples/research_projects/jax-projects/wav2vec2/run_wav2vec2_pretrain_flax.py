@@ -553,6 +553,7 @@ def main():
     for epoch in epochs:
         # ======================== Training ================================
         train_start = time.time()
+        epochs.set_description(f"Epoch ... ({epoch + 1}/{num_epochs})")
 
         # Create sampling rng
         rng, input_rng = jax.random.split(rng)
