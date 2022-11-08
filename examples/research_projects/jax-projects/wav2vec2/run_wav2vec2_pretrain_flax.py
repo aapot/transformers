@@ -472,7 +472,7 @@ def main():
             batch.pop("sub_attention_mask", None)
 
             gumbel_temperature = jnp.clip(
-                model_args.max_gumbel_temperature * model_args.gumbel_temperature_decay**(state.step - 1),
+                model_args.max_gumbel_temperature * model_args.gumbel_temperature_decay**state.step,
                 a_min=model_args.min_gumbel_temperature,
             )
 
