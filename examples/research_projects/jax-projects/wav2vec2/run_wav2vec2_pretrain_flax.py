@@ -578,14 +578,14 @@ def main():
 
             cur_step = epoch * (num_train_samples // train_batch_size) + step
 
-            if cur_step % training_args.logging_steps == 0 and cur_step > 0:
+            if (cur_step + 1) % training_args.logging_steps == 0:
                 # Save metrics
                 train_metric = jax_utils.unreplicate(train_metric)
                 train_time += time.time() - train_start
                 if has_tensorboard and jax.process_index() == 0:
                     write_train_metric(summary_writer, train_metrics, train_time, cur_step)
 
-                log_str = f"Step... {cur_step} "
+                log_str = f"Step... {cur_step + 1} "
                 for k, v in train_metric.items():
                     log_str += "| {}: {}".format(k, v.item())
                 epochs.write(log_str)
