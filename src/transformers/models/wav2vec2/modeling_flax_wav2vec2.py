@@ -172,9 +172,7 @@ def _compute_mask_indices(
 
     # compute number of masked spans in batch
     input_lengths = (
-        attention_mask.sum(-1).tolist()
-        if attention_mask is not None
-        else [sequence_length for _ in range(batch_size)]
+        attention_mask.sum(-1).tolist() if attention_mask is not None else [sequence_length for _ in range(batch_size)]
     )
 
     # SpecAugment mask to fill
@@ -236,7 +234,9 @@ def _compute_mask_indices(
     return spec_aug_mask
 
 
-def _sample_negative_indices(features_shape: Tuple, num_negatives: int, mask_time_indices: Optional[np.ndarray] = None):
+def _sample_negative_indices(
+    features_shape: Tuple, num_negatives: int, mask_time_indices: Optional[np.ndarray] = None
+):
     """
     Sample `num_negatives` vectors from feature vectors.
     """
@@ -689,7 +689,7 @@ class FlaxWav2Vec2EncoderLayerStableLayerNormCollection(nn.Module):
                 )
 
                 hidden_states = layer_outputs[0]
-            
+
             if skip_the_layer:
                 layer_outputs = (None, None)
 
@@ -819,11 +819,13 @@ class FlaxWav2Vec2GumbelVectorQuantizer(nn.Module):
             # sample code vector probs via gumbel in differentiateable way
             gumbel_rng = self.make_rng("gumbel")
             gumbels = jax.random.gumbel(gumbel_rng, hidden_states.shape)
-            # pytorch implementation's gumbel_softmax uses 'hard' option which returns samples as one-hot vectors
+
             y_soft = nn.softmax((hidden_states + gumbels) / temperature)
+
+            # pytorch implementation's gumbel_softmax uses 'hard' option which returns samples as one-hot vectors
             index = y_soft.argmax(axis=-1)
-            y_hard = jnp.zeros_like(hidden_states).at[jnp.arange(len(hidden_states)), index].set(1.0)
-            codevector_probs = y_hard - y_soft + y_soft
+            y_hard = jax.nn.one_hot(index, y_soft.shape[-1]) * 1.0
+            codevector_probs = y_hard - jax.lax.stop_gradient(y_soft) + y_soft
 
             # compute perplexity
             codevector_soft_dist = nn.softmax(
@@ -1009,7 +1011,9 @@ class FlaxWav2Vec2PreTrainedModel(FlaxPreTrainedModel):
     def _get_feature_vector_attention_mask(
         self, feature_vector_length: int, attention_mask: jnp.ndarray, add_adapter=None
     ):
-        return self.module._get_feature_vector_attention_mask(feature_vector_length, attention_mask, add_adapter=add_adapter)
+        return self.module._get_feature_vector_attention_mask(
+            feature_vector_length, attention_mask, add_adapter=add_adapter
+        )
 
 
 class FlaxWav2Vec2Module(nn.Module):
@@ -1052,7 +1056,10 @@ class FlaxWav2Vec2Module(nn.Module):
 
         hidden_states, extract_features = self.feature_projection(extract_features, deterministic=deterministic)
         hidden_states = self._mask_hidden_states(
-            hidden_states, mask_time_indices=mask_time_indices, attention_mask=attention_mask, deterministic=deterministic
+            hidden_states,
+            mask_time_indices=mask_time_indices,
+            attention_mask=attention_mask,
+            deterministic=deterministic,
         )
 
         encoder_outputs = self.encoder(
@@ -1127,7 +1134,10 @@ class FlaxWav2Vec2Module(nn.Module):
                 mask_length=self.config.mask_feature_length,
                 min_masks=self.config.mask_feature_min_masks,
             )
-            mask_feature_indices = jnp.broadcast_to(mask_feature_indices[:, None], (mask_feature_indices.shape[0], sequence_length, mask_feature_indices.shape[-1]))
+            mask_feature_indices = jnp.broadcast_to(
+                mask_feature_indices[:, None],
+                (mask_feature_indices.shape[0], sequence_length, mask_feature_indices.shape[-1]),
+            )
             hidden_states = jnp.where(
                 mask_feature_indices,
                 0,
@@ -1379,7 +1389,9 @@ class FlaxWav2Vec2ForPreTrainingModule(nn.Module):
         """
         target_features = jnp.concatenate([target_features, negative_features], axis=0)
 
-        logits = optax.cosine_similarity(predicted_features, target_features, epsilon=1e-08) #torch.cosine_similarity has eps=1e-08
+        logits = optax.cosine_similarity(
+            predicted_features, target_features, epsilon=1e-08
+        )  # torch.cosine_similarity has eps=1e-08
 
         # apply temperature
         logits = logits / temperature
@@ -1439,7 +1451,9 @@ class FlaxWav2Vec2ForPreTrainingModule(nn.Module):
             # 3. sample K negatives (distractors) quantized states for contrastive loss
             # if attention_mask is passed, make sure that padded feature vectors cannot be sampled
             # sample negative quantized vectors BTC => (BxT)C
-            negative_quantized_features = quantized_features.reshape(-1, hidden_size)[sampled_negative_indices.reshape(-1)]
+            negative_quantized_features = quantized_features.reshape(-1, hidden_size)[
+                sampled_negative_indices.reshape(-1)
+            ]
             negative_quantized_features = negative_quantized_features.reshape(
                 batch_size, sequence_length, -1, hidden_size
             ).transpose(2, 0, 1, 3)
@@ -1464,7 +1478,7 @@ class FlaxWav2Vec2ForPreTrainingModule(nn.Module):
             # -log(exp(sim(c_t, q_t)/\kappa) / \sum_{\sim{q}} exp(sim(c_t, \sim{q})/\kappa))
             logits = logits.transpose(2, 1, 0).reshape(-1, logits.shape[0])
             target = ((1 - mask_time_indices) * -100).transpose(1, 0).flatten()
-            
+
             target_mask = jnp.where(target >= 0, 1.0, 0.0)
             contrastive_loss = optax.softmax_cross_entropy(logits, onehot(target, logits.shape[-1])) * target_mask
             contrastive_loss = contrastive_loss.sum()
