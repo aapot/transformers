@@ -22,7 +22,7 @@ from flax import jax_utils, traverse_util
 from flax.training import train_state
 from flax.training.common_utils import get_metrics, onehot, shard
 
-from huggingface_hub import Repository
+from huggingface_hub import Repository, create_repo
 import transformers
 from transformers import (
     FlaxWav2Vec2ForPreTraining,
@@ -313,12 +313,13 @@ def main():
     # Handle the repository creation
     if training_args.push_to_hub:
         if training_args.hub_model_id is None:
-            repo_name = get_full_repo_name(
-                Path(training_args.output_dir).absolute().name, token=training_args.hub_token
-            )
+            repo_name = get_full_repo_name(Path(training_args.output_dir).name, token=training_args.hub_token)
         else:
             repo_name = training_args.hub_model_id
-        repo = Repository(training_args.output_dir, clone_from=repo_name)
+        create_repo(repo_name, exist_ok=True, token=training_args.hub_token)
+        repo = Repository(training_args.output_dir, clone_from=repo_name, token=training_args.hub_token)
+    elif training_args.output_dir is not None:
+        os.makedirs(training_args.output_dir, exist_ok=True)
 
     # 1. Download and create train, validation dataset
     # We load all dataset configuration and datset split pairs passed in
@@ -624,7 +625,7 @@ def main():
 
             cur_step = epoch * (num_train_samples // train_batch_size) + step
 
-            if (cur_step + 1) % training_args.logging_steps == 0:
+            if training_args.logging_steps and (cur_step + 1) % training_args.logging_steps == 0:
                 # Save metrics
                 train_metric = jax_utils.unreplicate(train_metric)
                 train_time += time.time() - train_start
@@ -638,7 +639,7 @@ def main():
 
                 train_metrics = []
 
-            if (cur_step + 1) % training_args.eval_steps == 0:
+            if training_args.eval_steps and (cur_step + 1) % training_args.eval_steps == 0:
                 # ======================== Evaluating ==============================
                 # Avoid using jax.numpy here in case of TPU training
                 eval_samples_idx = np.arange(num_eval_samples)
@@ -668,7 +669,7 @@ def main():
                 if has_tensorboard and jax.process_index() == 0:
                     write_eval_metric(summary_writer, eval_metrics, cur_step)
 
-            if (cur_step + 1) % training_args.save_steps == 0:
+            if training_args.save_steps and (cur_step + 1) % training_args.save_steps == 0:
                 # save checkpoint and push checkpoint to the hub
                 if jax.process_index() == 0:
                     params = jax.device_get(jax.tree_util.tree_map(lambda x: x[0], state.params))
