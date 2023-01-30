@@ -39,6 +39,7 @@ from transformers.models.wav2vec2.modeling_flax_wav2vec2 import _compute_mask_in
 
 logger = logging.getLogger(__name__)
 
+
 @flax.struct.dataclass
 class ModelArguments:
     """
@@ -92,14 +93,11 @@ class DataTrainingArguments:
         default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
     )
     dataset_config_names: List[str] = field(
-        default=None,
-        metadata={"help": "The configuration names of the dataset to use (via the datasets library)."}
+        default=None, metadata={"help": "The configuration names of the dataset to use (via the datasets library)."}
     )
     dataset_split_names: List[str] = field(
         default=None,
-        metadata={
-            "help": "The names of the training data set splits to use (via the datasets library)."
-        },
+        metadata={"help": "The names of the training data set splits to use (via the datasets library)."},
     )
     validation_split_name: Optional[str] = field(
         default="validation",
@@ -130,7 +128,8 @@ class DataTrainingArguments:
         default=5.0, metadata={"help": "Filter out audio files that are longer than `max_duration_in_seconds` seconds"}
     )
     min_duration_in_seconds: Optional[float] = field(
-        default=3.0, metadata={"help": "Filter out audio files that are shorter than `min_duration_in_seconds` seconds"}
+        default=3.0,
+        metadata={"help": "Filter out audio files that are shorter than `min_duration_in_seconds` seconds"},
     )
     pad_to_multiple_of: Optional[int] = field(
         default=None,
@@ -310,7 +309,7 @@ def main():
     # Next, we concatenate all configurations and splits into a single training dataset
     raw_datasets = DatasetDict()
     if len(datasets_splits) > 1:
-        raw_datasets["train"] = concatenate_datasets(datasets_splits)#.shuffle(seed=training_args.seed)
+        raw_datasets["train"] = concatenate_datasets(datasets_splits).shuffle(seed=training_args.seed)
     else:
         raw_datasets["train"] = datasets_splits[0]
 
@@ -360,11 +359,10 @@ def main():
         return batch
 
     vectorized_datasets = raw_datasets.map(
-            prepare_dataset,
-            num_proc=data_args.preprocessing_num_workers,
-            remove_columns=raw_datasets["train"].column_names,
-     
-        )
+        prepare_dataset,
+        num_proc=data_args.preprocessing_num_workers,
+        remove_columns=raw_datasets["train"].column_names,
+    )
 
     if min_length > 0.0:
         vectorized_datasets = vectorized_datasets.filter(
@@ -469,7 +467,10 @@ def main():
         gumbel_rng, new_gumbel_rng = jax.random.split(gumbel_rng)
 
         def loss_fn(params):
-            batch.pop("sub_attention_mask", None)
+            sub_attention_mask = batch.pop("sub_attention_mask", None)
+            sub_attention_mask = (
+                sub_attention_mask if sub_attention_mask is not None else jnp.ones_like(batch["mask_time_indices"])
+            )
 
             gumbel_temperature = jnp.clip(
                 model_args.max_gumbel_temperature * model_args.gumbel_temperature_decay**state.step,
@@ -485,7 +486,13 @@ def main():
                 train=True,
             )
 
-            return outputs.loss, {"gumbel_temperature": gumbel_temperature, "contrastive_loss": outputs.contrastive_loss, "diversity_loss": outputs.diversity_loss, "codevector_perplexity": outputs.codevector_perplexity}
+            return outputs.loss, {
+                "gumbel_temperature": gumbel_temperature,
+                "contrastive_loss": outputs.contrastive_loss,
+                "diversity_loss": outputs.diversity_loss,
+                "codevector_perplexity": outputs.codevector_perplexity,
+                "sub_attention_mask": sub_attention_mask,
+            }
 
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
         (loss, logs), grad = grad_fn(state.params)
@@ -502,6 +509,7 @@ def main():
         logs["contrastive_loss"] = jax.lax.psum(logs["contrastive_loss"].sum(), "batch")
         logs["diversity_loss"] = jax.lax.psum(logs["diversity_loss"].sum(), "batch")
 
+        percent_masked = num_losses / jax.lax.psum(logs["sub_attention_mask"].sum(), "batch")
         metrics = jax.lax.pmean(
             {
                 "loss": loss / num_losses,
@@ -510,7 +518,9 @@ def main():
                 "codevector_perplexity": logs["codevector_perplexity"],
                 "lr": linear_decay_lr_schedule_fn(state.step),
                 "gumbel_temp": logs["gumbel_temperature"],
-            }, axis_name="batch"
+                "%_mask_idx": percent_masked,
+            },
+            axis_name="batch",
         )
 
         return new_state, metrics, new_dropout_rng, new_gumbel_rng
@@ -536,8 +546,9 @@ def main():
                 "loss": loss / num_losses,
                 "constrast_loss": contrastive_loss / num_losses,
                 "div_loss": diversity_loss / num_losses,
-                "codevector_perplexity": outputs.codevector_perplexity
-            }, axis_name="batch"
+                "codevector_perplexity": outputs.codevector_perplexity,
+            },
+            axis_name="batch",
         )
 
         return metrics
